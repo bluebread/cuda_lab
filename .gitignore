@@ -4,3 +4,9 @@
 /.vscode
 /cuda-samples
 /archive
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
