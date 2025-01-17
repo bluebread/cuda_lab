@@ -5,6 +5,9 @@
 #include <string>
 #include <random>
 #include <iostream>
+#include <iomanip>
+
+#include "utils.hpp"
 
 #define NUM_ITERATION   10
 
@@ -97,36 +100,6 @@ __host__ void fma_vector_h(DATA_T * C, DATA_T * A, DATA_T * B, int N) {
     }
 }
 
-__host__ void random_fill(DATA_T * d, int N) {
-    #pragma omp parallel 
-    {
-        std::random_device dev;
-        std::mt19937 rng(dev());
-        std::uniform_real_distribution<> dist(0, 1); 
-
-        #pragma omp for private(dist)
-        for (int i = 0; i < N; ++i) {
-            d[i] = dist(rng);
-        }
-    }
-}
-
-__host__ bool is_equal_vector(DATA_T * X, DATA_T * Y, int N) {
-    volatile bool is_equal = true;
-
-    #pragma omp parallel for
-    for (int i = 0; i < N; i++) {
-        if (! is_equal) 
-            continue;
-
-        if (std::abs(X[i] - Y[i]) >= 1e-6) {
-            is_equal = false;
-        }
-    }
-
-    return is_equal;
-}
-
 // compile command: nvcc -g -O3 -Xcompiler -fopenmp fma_vector.cu
 int main(int argc, const char * argv[]) {
     DATA_T * A_h, * B_h, * C_h;
@@ -140,49 +113,57 @@ int main(int argc, const char * argv[]) {
         N = std::stoi(argv[1]);
     }
     else {
+        perror("Usage: ./fma_vector <vector size>\n");
         exit(1);
     }
-
-    A_h = new DATA_T[N];
-    B_h = new DATA_T[N];
-    C_h = new DATA_T[N];
-
-    random_fill(A_h, N);
-    random_fill(B_h, N);
-    random_fill(C_h, N);
-
-    cudaMalloc((void **)&A_d, sizeof(DATA_T) * N);
-    cudaMalloc((void **)&B_d, sizeof(DATA_T) * N);
-    cudaMalloc((void **)&C_d, sizeof(DATA_T) * N);
-    cudaMemcpy(A_d, A_h, sizeof(DATA_T) * N, cudaMemcpyHostToDevice);
-    cudaMemcpy(B_d, B_h, sizeof(DATA_T) * N, cudaMemcpyHostToDevice);
-    cudaMemcpy(C_d, C_h, sizeof(DATA_T) * N, cudaMemcpyHostToDevice);
 
     int device;
     cudaDeviceProp props;
     cudaGetDevice(&device);
     cudaGetDeviceProperties(&props, device);
+    std::string bytes_s = utils::formatBytes(N * sizeof(DATA_T));
 
+    // Through the experiment, I found that the following two lines' performances are nearly the same.
     int num_threads_per_block = props.maxThreadsPerBlock;
-    int num_blocks = std::ceil((float)N / props.maxThreadsPerBlock);
+    // int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor);
+    int num_blocks = std::ceil((float)N / num_threads_per_block);
+
+    printf("Fused Multiply-Add Vector Operation\n");
+    printf("- data type: %s\n", MACRO_STR(DATA_T));
+    printf("- vector size: %d (%s)\n", N, bytes_s.c_str());
+    printf("- #blocks: %d\n", num_blocks);
+    printf("- #threads per block: %d\n", num_threads_per_block);
+
+    A_h = new DATA_T[N];
+    B_h = new DATA_T[N];
+    C_h = new DATA_T[N];
+
+    cudaMalloc((void **)&A_d, sizeof(DATA_T) * N);
+    cudaMalloc((void **)&B_d, sizeof(DATA_T) * N);
+    cudaMalloc((void **)&C_d, sizeof(DATA_T) * N);
+
+    utils::random_fill_d<DATA_T>(A_d, N);
+    utils::random_fill_d<DATA_T>(B_d, N);
+    utils::random_fill_d<DATA_T>(C_d, N);
+    cudaMemcpyAsync(A_h, A_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(B_h, B_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(C_h, C_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
+
+    cudaDeviceSynchronize();
 
     fma_vector_h(C_h, A_h, B_h, N);
     fma_vector_d<<<num_blocks, num_threads_per_block>>>(C_d, A_d, B_d, N);
     cudaMemcpy(A_h, C_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
 
-    printf("Fused Multiply-Add Vector Operation\n");
-    printf("- data type: %s\n", MACRO_STR(DATA_T));
-    printf("- vector size: %lu bytes\n", N * sizeof(DATA_T));
-    printf("- #blocks: %d\n", num_blocks);
-    printf("- #threads per block: %d\n", num_threads_per_block);
-
-    if (is_equal_vector(C_h, A_h, N)) {
+    if (utils::is_equal_vector_h<DATA_T>(C_h, A_h, N)) {
         printf("- calculation: correct\n");
     }
     else {
         printf("- calculation: incorrect\n");
         exit(1);
     }
+
+    double total_time = 0.0;
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
@@ -200,7 +181,10 @@ int main(int argc, const char * argv[]) {
         cudaEventElapsedTime(&tdiff, start, stop); 
 
         printf("- test %d: %.6f (ms)\n", k, tdiff);
+        total_time += tdiff;
     }
+
+    printf("Average time: %.6f (ms)\n", total_time / NUM_ITERATION);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
