@@ -124,8 +124,8 @@ int main(int argc, const char * argv[]) {
     std::string bytes_s = utils::formatBytes(N * sizeof(DATA_T));
 
     // Through the experiment, I found that the following two lines' performances are nearly the same.
-    int num_threads_per_block = props.maxThreadsPerBlock;
-    // int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor);
+    // int num_threads_per_block = props.maxThreadsPerBlock;
+    int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor) / 8;
     int num_blocks = std::ceil((float)N / num_threads_per_block);
 
     printf("Fused Multiply-Add Vector Operation\n");
