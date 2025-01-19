@@ -91,6 +91,7 @@ namespace utils {
 
             if (std::abs(X[i] - Y[i]) >= 1e-6) {
                 is_equal = false;
+                printf("X[%d] = %f, Y[%d] = %f\n", i, X[i], i, Y[i]);
             }
         }
 

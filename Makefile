@@ -16,7 +16,7 @@ $(BIN_DIR)/%.out: $(SRC_DIR)/%.cu
 	$(NVCC) $(CUDAFLAGS) $(CXXFLAGS) $< -o $@
 
 clean:
-	 -rf $(BIN_DIR)/*.out *.ii *.cubin *.ptx *.txt *.o *fatbin* *.module_id *.gpu *.cudafe* *.reg*
+	rm -rf $(BIN_DIR)/*.out *.ii *.cubin *.ptx *.txt *.o *fatbin* *.module_id *.gpu *.cudafe* *.reg*
 
 ptx:
 	$(NVCC) $(CUDAFLAGS) -ptx $(CU_FILES)

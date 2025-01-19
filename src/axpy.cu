@@ -33,6 +33,18 @@ __global__ void axpy_d_v1(int N, T alpha, const T * X, T * Y) {
     }
 }
 
+template <typename T>
+__global__ void axpy_d_v2(int N, T alpha, const T * X, T * Y) {
+    int section_size = 8;
+    int max_len = ceilf((float)N / gridDim.x / section_size) * section_size;
+    int base = max_len * blockIdx.x;
+    int len = min(max_len, N - base);
+
+    for (int i = threadIdx.x; i < len; i += blockDim.x) {
+        Y[base + i] = alpha * X[base + i] + Y[base + i];
+    }
+}
+
 template<typename T>
 __host__ void axpy_h(int N, T alpha, const T * X, T * Y) {
     #pragma omp parallel for
@@ -67,10 +79,10 @@ int main(int argc, const char * argv[]) {
     /* version 0*/
     // int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor);
     // int num_blocks = std::ceil((float)N / num_threads_per_block);
-    /* version 1 */
-    int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor) / 8;
+    /* version 1 & 2 */
+    int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor);
     int num_active_blocks_per_sm = props.maxThreadsPerMultiProcessor / num_threads_per_block;
-    int num_blocks_per_sm = (props.maxThreadsPerMultiProcessor / num_active_blocks_per_sm) * num_active_blocks_per_sm * 8;
+    int num_blocks_per_sm = (props.maxThreadsPerMultiProcessor / num_active_blocks_per_sm) * num_active_blocks_per_sm;
     int num_blocks = props.multiProcessorCount * num_blocks_per_sm;
 
     printf("BLAS `axpy` (level-1) Function\n");
@@ -106,7 +118,8 @@ int main(int argc, const char * argv[]) {
 
     cudaEventRecord(start);
     // axpy_d_v0<DATA_T><<<num_blocks, num_threads_per_block>>>(N, alpha, X_d, Y_d);
-    axpy_d_v1<DATA_T><<<num_blocks, num_threads_per_block>>>(N, alpha, X_d, Y_d);
+    // axpy_d_v1<DATA_T><<<num_blocks, num_threads_per_block>>>(N, alpha, X_d, Y_d);
+    axpy_d_v2<DATA_T><<<num_blocks, num_threads_per_block>>>(N, alpha, X_d, Y_d);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&tdiff, start, stop); 
