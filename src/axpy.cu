@@ -1,5 +1,6 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h> 
+#include <cublas_v2.h>
 #include <omp.h>
 #include <cstdio>
 #include <string>
@@ -35,6 +36,16 @@ __global__ void axpy_d_v1(int N, T alpha, const T * X, T * Y) {
 
 template <typename T>
 __global__ void axpy_d_v2(int N, T alpha, const T * X, T * Y) {
+    /**
+     * @brief This kernel (v2) aligns the address to improve performance compared to the v1 kernel.
+     *
+     * The main difference between this kernel (v2) and the v1 kernel is that v2 includes optimizations
+     * for memory alignment. By aligning the memory addresses, this kernel can take advantage of 
+     * coalesced memory accesses, which significantly improves the performance on the GPU.
+     * 
+     * Memory alignment ensures that the data accesses are more efficient, reducing the number of 
+     * memory transactions required and increasing the overall throughput of the kernel execution.
+     */
     int section_size = 8;
     int max_len = ceilf((float)N / gridDim.x / section_size) * section_size;
     int base = max_len * blockIdx.x;
@@ -56,6 +67,7 @@ __host__ void axpy_h(int N, T alpha, const T * X, T * Y) {
 int main(int argc, const char * argv[]) {
     DATA_T * X_h, * Y_h;
     DATA_T * X_d, * Y_d;
+    DATA_T * A_d, * B_d;
     DATA_T alpha;
     int N;
 
@@ -75,6 +87,8 @@ int main(int argc, const char * argv[]) {
     cudaGetDevice(&device);
     cudaGetDeviceProperties(&props, device);
     std::string bytes_s = utils::formatBytes(N * sizeof(DATA_T));
+    cublasHandle_t handle;
+    cublasCreate(&handle);
 
     /* version 0*/
     // int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor);
@@ -96,12 +110,16 @@ int main(int argc, const char * argv[]) {
     Y_h = new DATA_T[N];
     cudaMalloc((void **)&X_d, sizeof(DATA_T) * N);
     cudaMalloc((void **)&Y_d, sizeof(DATA_T) * N);
+    cudaMalloc((void **)&A_d, sizeof(DATA_T) * N);
+    cudaMalloc((void **)&B_d, sizeof(DATA_T) * N);
 
     alpha = utils::get_random_number();
     utils::random_fill_d<DATA_T>(X_d, N);
     utils::random_fill_d<DATA_T>(Y_d, N);
     cudaMemcpyAsync(X_h, X_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
     cudaMemcpyAsync(Y_h, Y_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(A_d, X_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(B_d, Y_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToDevice);
     cudaDeviceSynchronize();
 
     float tdiff;
@@ -128,19 +146,46 @@ int main(int argc, const char * argv[]) {
     cudaMemcpy(X_h, Y_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
 
     if (utils::is_equal_vector_h<DATA_T>(X_h, Y_h, N)) {
-        printf("- calculation: correct\n");
+        printf("- calculation (axpy_h - axpy_d): correct\n");
     }
     else {
-        printf("- calculation: incorrect\n");
+        printf("- calculation (axpy_h - axpy_d): incorrect\n");
         exit(1);
     }
 
+    cudaEventRecord(start);
+    #if DATA_T == float
+        cublasSaxpy(handle, N, &alpha, A_d, 1, B_d, 1);
+    #elif DATA_T == double
+        cublasDaxpy(handle, N, &alpha, A_d, 1, B_d, 1);
+    #else
+        perror("Unsupported data type\n");
+        exit(1);
+    #endif
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&tdiff, start, stop); 
+    printf("- Elasped time (cuBLAS axpy): %.6f (ms)\n", tdiff);
+
+    cudaMemcpy(X_h, B_d, sizeof(DATA_T) * N, cudaMemcpyDeviceToHost);
+
+    if (utils::is_equal_vector_h<DATA_T>(X_h, Y_h, N)) {
+        printf("- calculation (axpy_h - cuBLAS axpy): correct\n");
+    }
+    else {
+        printf("- calculation (axpy_h - cuBLAS axpy): incorrect\n");
+        exit(1);
+    }
+
+    cublasDestroy(handle);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
     delete[] X_h;
     delete[] Y_h;
     cudaFree(X_d);
     cudaFree(Y_d);
+    cudaFree(A_d);
+    cudaFree(B_d);
 
     return 0;
 }
