@@ -154,14 +154,7 @@ int main(int argc, const char * argv[]) {
     }
 
     cudaEventRecord(start);
-    #if DATA_T == float
-        cublasSaxpy(handle, N, &alpha, A_d, 1, B_d, 1);
-    #elif DATA_T == double
-        cublasDaxpy(handle, N, &alpha, A_d, 1, B_d, 1);
-    #else
-        perror("Unsupported data type\n");
-        exit(1);
-    #endif
+    cublasSaxpy(handle, N, &alpha, A_d, 1, B_d, 1);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&tdiff, start, stop); 
