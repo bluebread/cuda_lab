@@ -64,9 +64,13 @@ int main(int argc, const char * argv[]) {
     cudaGetDeviceProperties(&props, device);
     std::string bytes_s = utils::formatBytes(N * sizeof(DATA_T));
 
+    /* version 0*/
+    // int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor);
+    // int num_blocks = std::ceil((float)N / num_threads_per_block);
+    /* version 1 */
     int num_threads_per_block = std::gcd(props.maxThreadsPerBlock, props.maxThreadsPerMultiProcessor) / 8;
     int num_active_blocks_per_sm = props.maxThreadsPerMultiProcessor / num_threads_per_block;
-    int num_blocks_per_sm = (props.maxThreadsPerMultiProcessor / num_active_blocks_per_sm) * num_active_blocks_per_sm;
+    int num_blocks_per_sm = (props.maxThreadsPerMultiProcessor / num_active_blocks_per_sm) * num_active_blocks_per_sm * 8;
     int num_blocks = props.multiProcessorCount * num_blocks_per_sm;
 
     printf("BLAS `axpy` (level-1) Function\n");
