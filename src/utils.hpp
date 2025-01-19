@@ -16,6 +16,14 @@
 #include <cuda_runtime_api.h>
 
 namespace utils {
+    __host__ double get_random_number() {
+        std::random_device dev;
+        std::mt19937 rng(dev());
+        std::uniform_real_distribution<> dist(0, 1); 
+
+        return dist(rng);
+    }
+
     template<typename T>
     __host__ void random_fill_h(T * X, int N) {
         static_assert(std::is_floating_point<T>::value, "input X must be floating-point type pointer");

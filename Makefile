@@ -1,19 +1,22 @@
 CC=g++
 NVCC=nvcc
-CXXFLAGS= -Xcompiler -fopenmp,-Ofast,-Wextra,-g
-CUDAFLAGS= # -keep
+CXXFLAGS= -Xcompiler -fopenmp,-Wextra
+CUDAFLAGS= -g -O0 -lineinfo --generate-line-info
 
-CU_FILES := $(wildcard *.cu)
-EXE_FILES := $(CU_FILES:.cu=)
+SRC_DIR := src
+BIN_DIR := bin
+CU_FILES := $(wildcard $(SRC_DIR)/*.cu)
+EXE_FILES := $(patsubst $(SRC_DIR)/%.cu, $(BIN_DIR)/%.out, $(CU_FILES))
 
 .PHONY: clean ptx all
 
 all: $(EXE_FILES)
 
-%: %.cu
-	$(NVCC) $(CUDAFLAGS) $(CXXFLAGS) $< -o $@.out
+$(BIN_DIR)/%.out: $(SRC_DIR)/%.cu
+	$(NVCC) $(CUDAFLAGS) $(CXXFLAGS) $< -o $@
 
 clean:
-	rm -rf *.ii *.cubin *.ptx *.txt *.out *.o *fatbin* *.module_id *.gpu *.cudafe* *.reg*
+	 -rf $(BIN_DIR)/*.out *.ii *.cubin *.ptx *.txt *.o *fatbin* *.module_id *.gpu *.cudafe* *.reg*
+
 ptx:
 	$(NVCC) $(CUDAFLAGS) -ptx $(CU_FILES)

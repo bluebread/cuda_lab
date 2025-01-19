@@ -4,6 +4,7 @@
 /.vscode
 /cuda-samples
 /archive
+/bin/*
 *.i
 *.ii
 *.gpu
