@@ -1,7 +1,7 @@
 CC=g++
 NVCC=nvcc
 CXXFLAGS= -Xcompiler -fopenmp,-Wextra
-CUDAFLAGS= -g -O0 -lineinfo --generate-line-info -lcublas
+CUDAFLAGS= -g -O3 --generate-line-info -lcublas -arch=sm_89
 
 SRC_DIR := src
 BIN_DIR := bin

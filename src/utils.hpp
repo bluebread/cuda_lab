@@ -41,17 +41,27 @@ namespace utils {
 
     template<typename T>
     __host__ void random_fill_h(T * X, int N) {
-        static_assert(std::is_floating_point<T>::value, "input X must be floating-point type pointer");
-
         #pragma omp parallel 
         {
             std::random_device dev;
             std::mt19937 rng(dev());
-            std::uniform_real_distribution<> dist(0, 1); 
 
-            #pragma omp for private(dist)
-            for (int i = 0; i < N; ++i) {
-                X[i] = 2 * dist(rng) - 1;
+            if (std::is_integral<T>::value) {
+                T max_val = std::numeric_limits<T>::max();
+                std::uniform_int_distribution<> dist(0, max_val); 
+
+                #pragma omp for private(dist)
+                for (int i = 0; i < N; ++i) {
+                    X[i] = dist(rng) - (max_val / 2);
+                }
+            } 
+            else {
+                std::uniform_real_distribution<> dist(0, 10); 
+
+                #pragma omp for private(dist)
+                for (int i = 0; i < N; ++i) {
+                    X[i] = 2 * dist(rng) - 1;
+                }
             }
         }
     }

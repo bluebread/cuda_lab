@@ -35,7 +35,8 @@ __host__ void test_reduce_openmp(const data_t * X_h, int N) {
 
     float t = 0;
     cudaEventElapsedTime(&t, start, stop);
-    printf("- Elasped time (OpenMP): %f (ms) [ret. %f]\n", t, sum);
+    std::cout << "- Elasped time (OpenMP): " << t << " (ms) "
+        << "[ret. " << std::fixed << std::setprecision(6) << sum << "]\n";
 }
 
 __host__ void test_reduce_thrust(const data_t * X_h, int N) {
@@ -43,15 +44,17 @@ __host__ void test_reduce_thrust(const data_t * X_h, int N) {
     data_t * X_d;
     cudaMalloc(&X_d, N * sizeof(data_t));
     cudaMemcpy(X_d, X_h, N * sizeof(data_t), cudaMemcpyHostToDevice);
+    data_t zero = 0;
 
     cudaEventRecord(start);
-    data_t x = thrust::reduce(thrust::device, X_d, X_d + N, 0.0f);
+    data_t x = thrust::reduce(thrust::device, X_d, X_d + N, zero);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
     float t = 0;
     cudaEventElapsedTime(&t, start, stop);
-    printf("- Elasped time (Thrust): %f (ms) [ret. %f]\n", t, x);
+    std::cout << "- Elasped time (Thrust): " << t << " (ms) "
+        << "[ret. " << std::fixed << std::setprecision(6) << x << "]\n";
 
     cudaFree(X_d);
 }
@@ -82,8 +85,9 @@ __host__ void test_reduce_cub(const data_t * X_h, int N) {
     cudaEventElapsedTime(&t, start, stop);
     cudaMemcpy(&result_h, result_d, sizeof(data_t), cudaMemcpyDeviceToHost);
 
-    printf("- Elasped time (CUB): %f (ms) "
-        "[ret. %f, temp. storage %lu bytes]\n", t, result_h, temp_storage_bytes);
+    std::cout << "- Elasped time (CUB): " << t << " (ms) "
+        << "[ret. " << std::fixed << std::setprecision(6) << result_h 
+        << ", temp. storage " << temp_storage_bytes << " bytes]\n";
 
     cudaFree(X_d);
     cudaFree(result_d);
@@ -135,6 +139,7 @@ __global__ void reduce_d_v2(const data_t * X, data_t * result, int N) {
 
     if (threadIdx.x < blockDim.x / 32) {
         sum = sdata[threadIdx.x];
+        
         sum += __shfl_down_sync(__activemask(), sum, 16);
         sum += __shfl_down_sync(__activemask(), sum, 8);
         sum += __shfl_down_sync(__activemask(), sum, 4);
@@ -158,11 +163,16 @@ __global__ void reduce_d_v3(const data_t * X, data_t * out, int N) {
         sum += X[j];
     }
 
-    sum += __shfl_down_sync(__activemask(), sum, 16);
-    sum += __shfl_down_sync(__activemask(), sum, 8);
-    sum += __shfl_down_sync(__activemask(), sum, 4);
-    sum += __shfl_down_sync(__activemask(), sum, 2);
-    sum += __shfl_down_sync(__activemask(), sum, 1);
+    if (std::is_integral<data_t>::value) {
+        sum = __reduce_add_sync(__activemask(), (int)sum);
+    }
+    else {
+        sum += __shfl_down_sync(__activemask(), sum, 16);
+        sum += __shfl_down_sync(__activemask(), sum, 8);
+        sum += __shfl_down_sync(__activemask(), sum, 4);
+        sum += __shfl_down_sync(__activemask(), sum, 2);
+        sum += __shfl_down_sync(__activemask(), sum, 1);
+    }
 
     if (threadIdx.x % 32 == 0) {
         sdata[threadIdx.x / 32] = sum;
@@ -171,11 +181,17 @@ __global__ void reduce_d_v3(const data_t * X, data_t * out, int N) {
 
     if (threadIdx.x < blockDim.x / 32) {
         sum = sdata[threadIdx.x];
-        sum += __shfl_down_sync(__activemask(), sum, 16);
-        sum += __shfl_down_sync(__activemask(), sum, 8);
-        sum += __shfl_down_sync(__activemask(), sum, 4);
-        sum += __shfl_down_sync(__activemask(), sum, 2);
-        sum += __shfl_down_sync(__activemask(), sum, 1);
+
+        if (std::is_integral<data_t>::value) {
+            sum = __reduce_add_sync(__activemask(), (int)sum);
+        }
+        else {
+            sum += __shfl_down_sync(__activemask(), sum, 16);
+            sum += __shfl_down_sync(__activemask(), sum, 8);
+            sum += __shfl_down_sync(__activemask(), sum, 4);
+            sum += __shfl_down_sync(__activemask(), sum, 2);
+            sum += __shfl_down_sync(__activemask(), sum, 1);
+        }
         
         if (threadIdx.x == 0) {
             out[blockIdx.x] = sum;
@@ -236,12 +252,12 @@ __host__ void test_reduce_handcraft(const data_t * X_h, int N) {
     float t = 0;
     cudaEventElapsedTime(&t, start, stop);
     cudaMemcpy(&result_h, result_d, sizeof(data_t), cudaMemcpyDeviceToHost);
-    printf("- Elasped time (handcraft %s): %f (ms) ["
-        "ret. %f, "
-        "#threads %d, "
-        "#blocks %d, "
-        "shared mem. %d btyes/block]\n", 
-        version, t, result_h, num_threads_per_block, num_blocks, shared_memory_size);
+
+    std::cout << "- Elasped time (handcraft " << version << "): " << t << " (ms) ["
+              << "ret. "  << std::fixed << std::setprecision(6) << result_h << ", "
+              << "#threads " << num_threads_per_block << ", "
+              << "#blocks " << num_blocks << ", "
+              << "shared mem. " << shared_memory_size << " bytes/block]\n";
 
     cudaFree(X_d);
     cudaFree(result_d);
@@ -262,10 +278,7 @@ __host__ void print_info(int N) {
 int main(int argc, const char * argv[]) {
     int N;
 
-    bool is_data_type_valid = 
-        std::is_same<data_t, float>::value || std::is_same<data_t, double>::value;
-
-    if (argc > 1 && is_data_type_valid) {
+    if (argc > 1) {
         N = std::stoi(argv[1]);
     }
     else {
