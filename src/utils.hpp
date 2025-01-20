@@ -7,6 +7,8 @@
 #include <string>
 #include <numeric>
 #include <cassert>
+#include <typeinfo>
+#include <cxxabi.h>
 
 #include <omp.h>
 #include <curand_kernel.h>
@@ -16,6 +18,19 @@
 #include <cuda_runtime_api.h>
 
 namespace utils {
+    template<typename T>
+    __host__ const std::string get_type_name(const T variable = 0) {
+        const char* const name = typeid(variable).name();
+        int status = -4;
+        char* const demangled_name = abi::__cxa_demangle(name, NULL, NULL, &status);
+        std::string ret{name};
+        if (status == 0) {
+            ret = std::string(demangled_name);
+            free(demangled_name);
+        }
+        return ret;
+    }
+
     __host__ double get_random_number() {
         std::random_device dev;
         std::mt19937 rng(dev());
@@ -36,7 +51,7 @@ namespace utils {
 
             #pragma omp for private(dist)
             for (int i = 0; i < N; ++i) {
-                X[i] = dist(rng);
+                X[i] = 2 * dist(rng) - 1;
             }
         }
     }
