@@ -19,7 +19,7 @@
 
 #include "utils.hpp"
 
-using data_t = float;
+using data_t = int; // float or int
 
 cudaEvent_t start, stop;
 
@@ -289,7 +289,14 @@ int main(int argc, const char * argv[]) {
     print_info(N);
 
     data_t * X_h = new data_t[N];
-    utils::random_fill_h<data_t>(X_h, N); 
+
+    if (std::is_integral<data_t>::value) {
+        data_t max_v = std::numeric_limits<data_t>::max();
+        utils::random_fill_h<data_t>(X_h, N, - max_v / 3, max_v / 3); 
+    }
+    else {
+        utils::random_fill_h<data_t>(X_h, N, -1.0, 1.0); 
+    }
 
     cudaEventCreate(&start);
     cudaEventCreate(&stop);

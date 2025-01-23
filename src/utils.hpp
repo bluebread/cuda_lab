@@ -40,27 +40,28 @@ namespace utils {
     }
 
     template<typename T>
-    __host__ void random_fill_h(T * X, int N) {
+    __host__ void random_fill_h(T * X, int N, T min = 0, T max = 1) {
         #pragma omp parallel 
         {
             std::random_device dev;
             std::mt19937 rng(dev());
+            int num_threads = omp_get_num_threads();
+            int tid = omp_get_thread_num();
+            int base = (N / num_threads) * tid + std::min(tid, N % num_threads);
+            int len = (N / num_threads) + (tid < N % num_threads);
 
             if (std::is_integral<T>::value) {
-                T max_val = std::numeric_limits<T>::max();
-                std::uniform_int_distribution<> dist(0, max_val); 
+                std::uniform_int_distribution<> dist(min, max); 
 
-                #pragma omp for private(dist)
-                for (int i = 0; i < N; ++i) {
-                    X[i] = dist(rng) - (max_val / 2);
+                for (int i = 0; i < len; ++i) {
+                    X[base + i] = dist(rng);
                 }
             } 
             else {
-                std::uniform_real_distribution<> dist(0, 10); 
+                std::uniform_real_distribution<> dist(min, max); 
 
-                #pragma omp for private(dist)
-                for (int i = 0; i < N; ++i) {
-                    X[i] = 2 * dist(rng) - 1;
+                for (int i = 0; i < len; ++i) {
+                    X[base + i] = dist(rng);
                 }
             }
         }
@@ -102,6 +103,7 @@ namespace utils {
         assert(num_blocks * num_threads_per_block <= N);
 
         random_fill_d_kernel<<<num_blocks, num_threads_per_block>>>(X, N);
+        cudaDeviceSynchronize();
     }
 
     template<typename T>
