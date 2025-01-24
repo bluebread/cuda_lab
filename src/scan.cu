@@ -47,6 +47,8 @@ __global__ void check_results_kernel(const data_t * Y_d, const data_t * ans_d, i
             return;
         }
         if (Y_d[base + i] != ans_d[base + i]) {
+            int idx = threadIdx.x + blockIdx.x * blockDim.x;    
+            printf("%d: Y %d != ans %d\n", idx, Y_d[base + i], ans_d[base + i]);
             *is_correct = false;
             return;
         }
@@ -181,15 +183,15 @@ __global__ void scan_d_kernel(
             data_t yi = xi;
             data_t yi_prev = 0;
 
-            yi_prev = __shfl_up_sync(__activemask(), yi, 1);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 1);
             yi += (laneIdx >= 1) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 2);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 2);
             yi += (laneIdx >= 2) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 4);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 4);
             yi += (laneIdx >= 4) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 8);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 8);
             yi += (laneIdx >= 8) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 16);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 16);
             yi += (laneIdx >= 16) ? yi_prev : 0;
 
             Y_s[i] = yi - xi;
@@ -208,15 +210,15 @@ __global__ void scan_d_kernel(
             data_t yi = xi;
             data_t yi_prev = 0;
 
-            yi_prev = __shfl_up_sync(__activemask(), yi, 1);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 1);
             yi += (laneIdx >= 1) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 2);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 2);
             yi += (laneIdx >= 2) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 4);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 4);
             yi += (laneIdx >= 4) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 8);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 8);
             yi += (laneIdx >= 8) ? yi_prev : 0;
-            yi_prev = __shfl_up_sync(__activemask(), yi, 16);
+            yi_prev = __shfl_up_sync(0xffffffff, yi, 16);
             yi += (laneIdx >= 16) ? yi_prev : 0;
 
             sdata[threadIdx.x] = yi - xi;
@@ -227,10 +229,8 @@ __global__ void scan_d_kernel(
 
         for (int i = threadIdx.x; i < len; i += blockDim.x) {
             Y_s[i] += sdata[i / warpSize];
-            Y[base + i] = Y_s[i]; // debug
+            // Y[base + i] = Y_s[i]; // debug
         }
-
-        return;
 
         __syncthreads();
 
@@ -239,21 +239,20 @@ __global__ void scan_d_kernel(
 
         data_t pred_sum = 0;
 
-        if (warpIdx == 0 && laneIdx == warpSize - 1) {
+        if (threadIdx.x == warpSize - 1) {
             union AggregateDescriptor aggr_desr;
 
             // Optimization: Fence-free descriptor update
             aggr_desr.flag = true;
             aggr_desr.val = aggregate;
+            // atomicAdd((unsigned long long int *)(&aggregate_descriptor_table[bid_s].u64), aggr_desr.u64);
             aggregate_descriptor_table[bid_s].u64 = aggr_desr.u64;
         }
-
-        return;
 
         int inclpref_idx = -1;
 
         // Optimization: Parallelized look-back
-        for (int k = bid_s - blockDim.x + threadIdx.x; inclpref_idx < 0; k -= blockDim.x) {
+        for (int k = bid_s - blockDim.x + threadIdx.x; inclpref_idx < 0 && (int)(k - threadIdx.x + blockDim.x) > 0; k -= blockDim.x) {
             union AggregateDescriptor pred_ag;
             union InclusivePrefixDescriptor pred_ip;
 
@@ -268,66 +267,63 @@ __global__ void scan_d_kernel(
                 } while (pred_ag.flag == false);
                 __threadfence();
 
+                // pred_ip.u64 = atomicAdd(
+                //     (unsigned long long int *)(&inclusive_prefix_descriptor_table[k].u64), 0);
                 pred_ip.u64 = inclusive_prefix_descriptor_table[k].u64;
-                if (pred_ip.flag) {
+                if (pred_ip.flag == true) {
                     inclpref_idx = k;
                 }
             }
-            
-            inclpref_idx = __reduce_max_sync(__activemask(), inclpref_idx);
-            if (threadIdx.x % warpSize == 0)
-                sdata[threadIdx.x / warpSize] = inclpref_idx;
-            __syncthreads();
 
-            if (threadIdx.x < blockDim.x / warpSize) {
-                sdata[threadIdx.x] = __reduce_max_sync(__activemask(), sdata[threadIdx.x]);
+            inclpref_idx = __reduce_max_sync(0xffffffff, inclpref_idx);
+            if (laneIdx == 0)
+                sdata[warpIdx] = inclpref_idx;
+            __syncthreads();
+            if (threadIdx.x < warpSize) {
+                int temp = (threadIdx.x < blockDim.x / warpSize) ? sdata[threadIdx.x] : -1;
+                sdata[threadIdx.x] = __reduce_max_sync(0xffffffff, temp);
             }
             __syncthreads();
+            inclpref_idx = sdata[warpIdx];
 
-            inclpref_idx = sdata[threadIdx.x / warpSize];
-
-            // TODO: it is possible to have no predecessors with status "P". fix this.
             // Case 1: All predecessors have status "A"
-            if (inclpref_idx < 0 && k - threadIdx.x > 0) {
+            if (inclpref_idx < 0 && (int)(k - threadIdx.x) > 0) {
                 // Since all predecessors have status "A", we can safely add the value 
                 // and continue to the next iteration. 
                 pred_sum += pred_ag.val;
                 continue;
             }
-    
+
             // Case 2: At least one predecessor has status "P"
             if (k > inclpref_idx) 
                 pred_sum += pred_ag.val;
             else if (k == inclpref_idx) 
                 pred_sum += pred_ip.val;
                 
-            pred_sum = __reduce_add_sync(__activemask(), pred_sum);
-            if (threadIdx.x % warpSize == 0)
-                sdata[threadIdx.x / warpSize] = pred_sum;
+            pred_sum = __reduce_add_sync(0xffffffff, pred_sum);
+            if (laneIdx == 0)
+                sdata[warpIdx] = pred_sum;
             __syncthreads();
-
-            if (threadIdx.x < blockDim.x / warpSize) {
-                sdata[threadIdx.x] = __reduce_add_sync(__activemask(), sdata[threadIdx.x]);
+            if (threadIdx.x < warpSize) {
+                int temp = (threadIdx.x < blockDim.x / warpSize) ? sdata[threadIdx.x] : 0;
+                sdata[threadIdx.x] = __reduce_add_sync(0xffffffff, temp);
             }
             __syncthreads();
+            pred_sum = sdata[warpIdx];
 
-            pred_sum = sdata[threadIdx.x / warpSize];
-
-            for (int i = threadIdx.x; i < len; i += blockDim.x) {
-                Y_s[i] += pred_sum;
-                Y[base + i] = Y_s[i];
-            }
-
-            inclpref_idx = 0;
+            inclpref_idx = 0; // equivalent to break
         }
         
-        __syncthreads();
+        for (int i = threadIdx.x; i < len; i += blockDim.x) {
+            Y[base + i] = Y_s[i] + pred_sum; 
+        }
 
-        if (threadIdx.x == 0) {
+        if (threadIdx.x == warpSize - 1) {
             union InclusivePrefixDescriptor ip_desr;
 
             ip_desr.flag = true;
-            ip_desr.val = Y_s[len - 1];
+            ip_desr.val = pred_sum + aggregate;
+            // atomicAdd((unsigned long long int *)(&inclusive_prefix_descriptor_table[bid_s].u64), ip_desr.u64);
             inclusive_prefix_descriptor_table[bid_s].u64 = ip_desr.u64;
         }
 
@@ -339,13 +335,34 @@ __host__ void malloc_persisting_data(T ** ptr_addr, unsigned int n, float hit_ra
     cudaMalloc(ptr_addr, n * sizeof(T));
     cudaMemset(*ptr_addr, 0, n * sizeof(T));
 
-    cudaStreamAttrValue stream_attribute;   
-    stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(ptr_addr);
-    stream_attribute.accessPolicyWindow.num_bytes = n * sizeof(T);
-    stream_attribute.accessPolicyWindow.hitRatio  = hit_ratio;
-    stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-    stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-    cudaStreamSetAttribute(cudaStreamDefault, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+    // cudaStreamAttrValue stream_attribute;   
+    // stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(*ptr_addr);
+    // stream_attribute.accessPolicyWindow.num_bytes = n * sizeof(T);
+    // stream_attribute.accessPolicyWindow.hitRatio  = hit_ratio;
+    // stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    // stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    // cudaStreamSetAttribute(cudaStreamDefault, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+}
+
+__host__ std::string descriptor_to_string(AggregateDescriptor agd, InclusivePrefixDescriptor ipd) {
+    std::string res = "(";
+    
+    if (agd.flag == false) {
+        res += "X)";
+    }
+    else {
+        if (ipd.flag == false) {
+            res += "A,";
+            res += std::to_string(agd.val) + ")";
+        }
+        else {
+            res += "P,";
+            res += std::to_string(agd.val) + ",";
+            res += std::to_string(ipd.val) + ")";
+        }
+    }
+
+    return res;
 }
 
 __host__ void test_scan_handcraft(const data_t * X_h, const data_t * ans_h, int N) {
@@ -389,28 +406,39 @@ __host__ void test_scan_handcraft(const data_t * X_h, const data_t * ans_h, int 
     cudaEventElapsedTime(&t, start, stop);
 
     // debug
-    data_t * Y_h = new data_t[N];
-    int * block_counter_h = new int[1];
-    cudaMemcpy(Y_h, Y_d, N * sizeof(data_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(block_counter_h, block_counter_d, sizeof(int), cudaMemcpyDeviceToHost);
-    printf("num_threads: %d\n", num_threads);
-    printf("num_blocks: %d\n", num_blocks);
-    printf("partition_size: %d\n", partition_size);
-    printf("num_partitions: %d\n", num_partitions);
-    printf("block_counter: %d\n", *block_counter_h);
-    for (int i = 0; i < 1024; i++) {
-        std::cout << Y_h[i] << " ";
-        if (i % 32 == 31) {
-            std::cout << std::endl;
-        }
-    }
-    std::cout << std::endl;
+    // data_t * Y_h = new data_t[N];
+    // int * block_counter_h = new int[1];
+    // cudaMemcpy(Y_h, Y_d, N * sizeof(data_t), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(block_counter_h, block_counter_d, sizeof(int), cudaMemcpyDeviceToHost);
+    // printf("num_threads: %d\n", num_threads);
+    // printf("num_blocks: %d\n", num_blocks);
+    // printf("partition_size: %d\n", partition_size);
+    // printf("num_partitions: %d\n", num_partitions);
+    // printf("block_counter: %d\n", *block_counter_h);
+    // for (int i = 0; i < 1024; i++) {
+    //     std::cout << Y_h[i] << " ";
+    //     if (i % 32 == 31) {
+    //         std::cout << std::endl;
+    //     }
+    // }
+    // std::cout << std::endl;
+    // union AggregateDescriptor * aggregate_descriptor_table_h = new union AggregateDescriptor[num_partitions];
+    // union InclusivePrefixDescriptor * inclusive_prefix_descriptor_table_h = new union InclusivePrefixDescriptor[num_partitions];
+    // cudaMemcpy(aggregate_descriptor_table_h, aggregate_descriptor_table_d, num_partitions * sizeof(union AggregateDescriptor), cudaMemcpyDeviceToHost);
+    // cudaMemcpy(inclusive_prefix_descriptor_table_h, inclusive_prefix_descriptor_table_d, num_partitions * sizeof(union InclusivePrefixDescriptor), cudaMemcpyDeviceToHost);
+    // std::cout << "descriptor_table: ";
+    // for (int i = 0; i < num_partitions; i++) {
+    //     std::cout << descriptor_to_string(aggregate_descriptor_table_h[i], inclusive_prefix_descriptor_table_h[i]) << " ";
+    //     // std::cout << std::to_string(aggregate_descriptor_table_h[i].val) << " ";
+    // }
+    // std::cout << std::endl;
 
 
     const char * is_correct_s = check_results(Y_d, ans_d, N) ? "correct" : "incorrect";
     float throughput = (float)(N * sizeof(data_t) * 2) / (t * 1e-3) / 1e9;
     std::cout << "- Throughput (handcraft): " << throughput << " GB/s"
-        << " [" << is_correct_s << ", time: " << t << " ms]\n"; 
+        << " [" << is_correct_s << ", time: " << t << " ms, "
+        << "#partitions: " << num_partitions << "]\n"; 
 
     cudaFree(X_d);
     cudaFree(Y_d);
@@ -432,6 +460,8 @@ __host__ void print_info(int N) {
     printf("- vector size: %d (%s)\n", N, bytes_s.c_str());
     printf("- #SMs: %d\n", props.multiProcessorCount);
     printf("- bandwidth: %.3f GB/s\n", bandwidth);
+    printf("- max block per SM: %d\n", props.maxBlocksPerMultiProcessor);
+    printf("- shared mem. size: %lu bytes/sm\n", props.sharedMemPerMultiprocessor);
     printf("- L2 Cache Size: %d bytes\n", props.l2CacheSize);
     printf("- Persisting L2 Cache Max Size: %d bytes\n", props.persistingL2CacheMaxSize);
 }
@@ -454,21 +484,33 @@ __host__ int main(int argc, char ** argv) {
     utils::random_fill_h<data_t>(X_h, N, 0, 10); 
     test_scan_openmp(X_h, Y_h, N);
 
-    // for(int i = 0; i < 256; i++) {
+    // for(int i = 0; i < 1024; i++) {
     //     std::cout << X_h[i] << " ";
     //     if (i % 32 == 31) {
     //         std::cout << std::endl;
     //     }
     // }
     // std::cout << std::endl;
-    std::cout << "----------------------------------------" << std::endl;
-    for(int i = 0; i <  1024; i++) {
-        std::cout << Y_h[i] << " ";
-        if (i % 32 == 31) {
-            std::cout << std::endl;
-        }
-    }
-    std::cout << std::endl;
+    // std::cout << "----------------------------------------" << std::endl;
+    // for(int i = 0; i <  1024; i++) {
+    //     std::cout << Y_h[i] << " ";
+    //     if (i % 32 == 31) {
+    //         std::cout << std::endl;
+    //     }
+    // }
+    // std::cout << std::endl;
+    // std::cout << "----------------------------------------" << std::endl;
+    // for (int p = 0; p < (N + 1023) / 1024; p++) {
+    //     data_t scan_h = 0;
+    //     for (int i = 0; i < 1024; i++) {
+    //         if (p * 1024 + i >= N) {
+    //             break;
+    //         }
+    //         scan_h += X_h[p * 1024 + i];
+    //     }
+    //     printf("%d ", scan_h);
+    // }
+    // std::cout << std::endl;
 
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
