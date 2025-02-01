@@ -3,6 +3,7 @@
 
 #include <random>
 #include <iostream>
+#include <sstream>
 #include <iomanip>
 #include <string>
 #include <numeric>
@@ -44,8 +45,8 @@ namespace utils {
         #pragma omp parallel 
         {
             std::random_device dev;
-            std::mt19937 rng(dev());
-            // std::mt19937 rng(0);
+            // std::mt19937 rng(dev());
+            std::mt19937 rng(0);
             int num_threads = omp_get_num_threads();
             int tid = omp_get_thread_num();
             int base = (N / num_threads) * tid + std::min(tid, N % num_threads);
