@@ -63,7 +63,6 @@ __global__ void check_results_kernel(const data_t * Y_d, const data_t * ans_d, i
         }
         if (Y_d[base + i] != ans_d[base + i]) {
             int idx = threadIdx.x + blockIdx.x * blockDim.x;    
-            // printf("%d: Y %d != ans %d\n", idx, Y_d[base + i], ans_d[base + i]);
             *is_correct = false;
             return;
         }
@@ -89,12 +88,22 @@ __host__ bool check_results(const data_t * Y_d, const data_t * ans_d, int N) {
 __host__ void test_scan_openmp(const data_t * X_h, data_t * Y_h, int N) {
     data_t scan_h = 0;
 
+    cudaEventRecord(start);
+
     #pragma omp simd reduction(inscan, +:scan_h)
     for (int i = 0; i < N; i++) {
         Y_h[i] = scan_h;
         #pragma omp scan exclusive(scan_h)
         scan_h += X_h[i];
     }
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float t;
+    cudaEventElapsedTime(&t, start, stop);
+
+    std::cout << "- Elasped time (OpenMP): " << t << " ms\n";
 }
 
 __host__ void test_memcpy_d2d(const data_t * X_h, const data_t * ans_h, int N) {
@@ -233,17 +242,26 @@ __global__ void scan_d_kernel_v2(
     unsigned int *      block_counter,
     Descriptor *        descriptor_table) {
 
+    // In this kernel, we use the Kogge-Stone algorithm for the warp level scan,
+    // the coarsened scan for the block level scan, and the Merrill-Garland algorithm
+    // for the device level scan.
+
+    // The number of threads per block is fixed to 256.
+    // Each thread holds 16 elements, so the partition size is 16 * 256 = 4096.
+    const int partition_size = 4 * warpSize * warpSize;
+
+    // The eight of the elemtns are saved in the shared memory, and the rest are saved in the registers.
     __shared__ data_t Y_s[2048];
-    __shared__ data_t sdata[128];
-    __shared__ unsigned int bid_s;
+    __shared__ data_t sdata[128]; // used for saving the sum of the elements in the warp
+    __shared__ unsigned int bid_s; // dynamic block index
     
     const int warpIdx = threadIdx.x / warpSize;
     const int laneIdx = threadIdx.x % warpSize;
     const int num_warps = blockDim.x / warpSize;
-    const int partition_size = 4 * warpSize * warpSize;
     
     int base, len;
 
+    // Get the first block id
     if (threadIdx.x == 0) {
         bid_s = atomicAdd(block_counter, 1);
     }
@@ -304,6 +322,7 @@ __global__ void scan_d_kernel_v2(
         y15 = warp_exclusive_scan(x15);
 
         if (laneIdx == warpSize - 1) {
+            // Save the sum of the elements in the warp
             sdata[warpIdx + 0 * num_warps] = x0 + y0;
             sdata[warpIdx + 1 * num_warps] = x1 + y1;
             sdata[warpIdx + 2 * num_warps] = x2 + y2;
@@ -332,7 +351,7 @@ __global__ void scan_d_kernel_v2(
             for (int i = 0; i < partition_size / (warpSize * warpSize); i++) {
                 data_t xi = sdata[threadIdx.x + i * warpSize];
                 data_t yi = warp_exclusive_scan(xi);
-                data_t s = __shfl_sync(0xffffffff, xi + yi, warpSize - 1);
+                data_t s = __shfl_sync(0xffffffff, xi + yi, warpSize - 1); // broadcast
                 sdata[threadIdx.x + i * warpSize] = yi + aggregate;
                 aggregate += s;
             }
@@ -375,6 +394,7 @@ __global__ void scan_d_kernel_v2(
         }
 
         // Optimization: Parallelized look-back
+        // "inclpref_idx < 0" indicates that there is no predecessor with status "P"
         for (int k = bid_s - blockDim.x + threadIdx.x; inclpref_idx < 0 && (int)(k - threadIdx.x + blockDim.x) > 0; k -= blockDim.x) {
             union Descriptor pred_desr;
 
@@ -382,6 +402,7 @@ __global__ void scan_d_kernel_v2(
             pred_desr.u64 = 0;
             
             if (k >= 0) {
+                // spinning until the predecessor's descriptor is valid
                 do {
                     pred_desr.u64 = atomicAdd(
                         (unsigned long long int *)(&descriptor_table[k].u64), 0);
@@ -393,6 +414,7 @@ __global__ void scan_d_kernel_v2(
                 }
             }
 
+            // the rightmost predecessor with status "P"
             inclpref_idx = block_reduce_max(inclpref_idx, sdata);
             
             // Case 1: All predecessors have status "A"
@@ -405,8 +427,10 @@ __global__ void scan_d_kernel_v2(
 
             // Case 2: At least one predecessor has status "P"
             if (k >= inclpref_idx) 
+                // incorporate the value of the predecessor with status "A"
                 pred_sum += pred_desr.val;
 
+            // compute the partition-wide inclusive prefix sum
             pred_sum = block_reduce_add(pred_sum, sdata);
 
             break;
@@ -558,7 +582,6 @@ __global__ void scan_d_kernel_v1(
 
         for (int i = threadIdx.x; i < len; i += blockDim.x) {
             Y_s[i] += sdata[i / warpSize];
-            // Y[base + i] = Y_s[i]; // debug
         }
 
         __syncthreads();
@@ -574,7 +597,6 @@ __global__ void scan_d_kernel_v1(
             // Optimization: Fence-free descriptor update
             aggr_desr.flag = true;
             aggr_desr.val = aggregate;
-            // atomicAdd((unsigned long long int *)(&aggregate_descriptor_table[bid_s].u64), aggr_desr.u64);
             aggregate_descriptor_table[bid_s].u64 = aggr_desr.u64;
         }
 
@@ -596,8 +618,6 @@ __global__ void scan_d_kernel_v1(
                 } while (pred_ag.flag == false);
                 __threadfence();
 
-                // pred_ip.u64 = atomicAdd(
-                //     (unsigned long long int *)(&inclusive_prefix_descriptor_table[k].u64), 0);
                 pred_ip.u64 = inclusive_prefix_descriptor_table[k].u64;
                 if (pred_ip.flag == true) {
                     inclpref_idx = k;
@@ -652,7 +672,6 @@ __global__ void scan_d_kernel_v1(
 
             ip_desr.flag = true;
             ip_desr.val = pred_sum + aggregate;
-            // atomicAdd((unsigned long long int *)(&inclusive_prefix_descriptor_table[bid_s].u64), ip_desr.u64);
             inclusive_prefix_descriptor_table[bid_s].u64 = ip_desr.u64;
         }
 
@@ -664,13 +683,13 @@ __host__ void malloc_persisting_data(T ** ptr_addr, unsigned int n, float hit_ra
     cudaMalloc(ptr_addr, n * sizeof(T));
     cudaMemset(*ptr_addr, 0, n * sizeof(T));
 
-    // cudaStreamAttrValue stream_attribute;   
-    // stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(*ptr_addr);
-    // stream_attribute.accessPolicyWindow.num_bytes = n * sizeof(T);
-    // stream_attribute.accessPolicyWindow.hitRatio  = hit_ratio;
-    // stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-    // stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-    // cudaStreamSetAttribute(cudaStreamDefault, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+    cudaStreamAttrValue stream_attribute;   
+    stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(*ptr_addr);
+    stream_attribute.accessPolicyWindow.num_bytes = n * sizeof(T);
+    stream_attribute.accessPolicyWindow.hitRatio  = hit_ratio;
+    stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(cudaStreamDefault, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
 }
 
 __host__ std::string descriptor_to_string(AggregateDescriptor agd, InclusivePrefixDescriptor ipd) {
@@ -702,20 +721,30 @@ __host__ void test_scan_handcraft(const data_t * X_h, const data_t * ans_h, int 
     cudaMemcpy(X_d, X_h, N * sizeof(data_t), cudaMemcpyHostToDevice);
     cudaMemcpy(ans_d, ans_h, N * sizeof(data_t), cudaMemcpyHostToDevice);
 
-    // `num_threads` should be no more than 1024 (warpSize * warpSize) and multiple of 32 (warpSize)
+    /* scan_d_kernel_v1 parameters */
+
+    // cudaDeviceProp prop = utils::get_device_properties();
+    // int num_threads = 256; 
+    // int num_blocks = prop.maxBlocksPerMultiProcessor * prop.multiProcessorCount;
+    // int partition_size = prop.warpSize * prop.warpSize;
+    // int num_partitions = (N + partition_size - 1) / partition_size;
+    // unsigned int * block_counter_d;
+    // union AggregateDescriptor * aggregate_descriptor_table_d;
+    // union InclusivePrefixDescriptor * inclusive_prefix_descriptor_table_d;
+    // malloc_persisting_data<AggregateDescriptor>(&aggregate_descriptor_table_d, num_partitions);
+    // malloc_persisting_data<InclusivePrefixDescriptor>(&inclusive_prefix_descriptor_table_d, num_partitions);
+    // malloc_persisting_data<unsigned int>(&block_counter_d, 1);
+    // cudaDeviceSynchronize();
+
+    /* scan_d_kernel_v2 parameters */
+
     cudaDeviceProp prop = utils::get_device_properties();
     int num_threads = 256; 
     int num_blocks = prop.maxBlocksPerMultiProcessor * prop.multiProcessorCount;
     int partition_size = 4 * prop.warpSize * prop.warpSize;
     int num_partitions = (N + partition_size - 1) / partition_size;
-
     unsigned int * block_counter_d;
-    union AggregateDescriptor * aggregate_descriptor_table_d;
-    union InclusivePrefixDescriptor * inclusive_prefix_descriptor_table_d;
     union Descriptor * descriptor_table_d;
-     
-    malloc_persisting_data<AggregateDescriptor>(&aggregate_descriptor_table_d, num_partitions);
-    malloc_persisting_data<InclusivePrefixDescriptor>(&inclusive_prefix_descriptor_table_d, num_partitions);
     malloc_persisting_data<unsigned int>(&block_counter_d, 1);
     malloc_persisting_data<Descriptor>(&descriptor_table_d, num_partitions);
     cudaDeviceSynchronize();
@@ -745,35 +774,6 @@ __host__ void test_scan_handcraft(const data_t * X_h, const data_t * ans_h, int 
     float t;
     cudaEventElapsedTime(&t, start, stop);
 
-    // debug
-    // data_t * Y_h = new data_t[N];
-    // int * block_counter_h = new int;
-    // cudaMemcpy(Y_h, Y_d, N * sizeof(data_t), cudaMemcpyDeviceToHost);
-    // cudaMemcpy(block_counter_h, block_counter_d, sizeof(int), cudaMemcpyDeviceToHost);
-    // printf("num_threads: %d\n", num_threads);
-    // printf("num_blocks: %d\n", num_blocks);
-    // printf("partition_size: %d\n", partition_size);
-    // printf("num_partitions: %d\n", num_partitions);
-    // printf("block_counter: %d\n", *block_counter_h);
-    // for (int i = 0; i < 4096; i++) {
-    //     std::cout << Y_h[i] << " ";
-    //     if (i % 256 == 255) {
-    //         std::cout << std::endl;
-    //     }
-    // }
-    // std::cout << std::endl;
-    // union AggregateDescriptor * aggregate_descriptor_table_h = new union AggregateDescriptor[num_partitions];
-    // union InclusivePrefixDescriptor * inclusive_prefix_descriptor_table_h = new union InclusivePrefixDescriptor[num_partitions];
-    // cudaMemcpy(aggregate_descriptor_table_h, aggregate_descriptor_table_d, num_partitions * sizeof(union AggregateDescriptor), cudaMemcpyDeviceToHost);
-    // cudaMemcpy(inclusive_prefix_descriptor_table_h, inclusive_prefix_descriptor_table_d, num_partitions * sizeof(union InclusivePrefixDescriptor), cudaMemcpyDeviceToHost);
-    // std::cout << "descriptor_table: ";
-    // for (int i = 0; i < num_partitions; i++) {
-    //     std::cout << descriptor_to_string(aggregate_descriptor_table_h[i], inclusive_prefix_descriptor_table_h[i]) << " ";
-    //     // std::cout << std::to_string(aggregate_descriptor_table_h[i].val) << " ";
-    // }
-    // std::cout << std::endl;
-
-
     const char * is_correct_s = check_results(Y_d, ans_d, N) ? "correct" : "incorrect";
     float throughput = (float)(N * sizeof(data_t) * 2) / (t * 1e-3) / 1e9;
     std::cout << "- Throughput (handcraft): " << throughput << " GB/s"
@@ -784,8 +784,8 @@ __host__ void test_scan_handcraft(const data_t * X_h, const data_t * ans_h, int 
     cudaFree(Y_d);
     cudaFree(ans_d);
     cudaFree(block_counter_d);
-    cudaFree(aggregate_descriptor_table_d);
-    cudaFree(inclusive_prefix_descriptor_table_d);
+    // cudaFree(aggregate_descriptor_table_d);
+    // cudaFree(inclusive_prefix_descriptor_table_d);
     cudaFree(descriptor_table_d);
 }
 
@@ -807,6 +807,7 @@ __host__ void print_info(int N) {
     printf("- Persisting L2 Cache Max Size: %d bytes\n", props.persistingL2CacheMaxSize);
 }
 
+// compile command: nvcc -g -O3 --generate-line-info -lcublas -arch=sm_89 -diag-suppress=177 --maxrregcount 80 -Xcompiler -fopenmp,-Wextra src/scan.cu -o bin/scan.out
 __host__ int main(int argc, char ** argv) {
     int N;
 
@@ -823,41 +824,12 @@ __host__ int main(int argc, char ** argv) {
     data_t * X_h = new data_t[N];
     data_t * Y_h = new data_t[N];
     utils::random_fill_h<data_t>(X_h, N, 0, 10); 
-    test_scan_openmp(X_h, Y_h, N);
-
-    // for(int i = 0; i < 4096; i++) {
-    //     std::cout << X_h[i] << " ";
-    //     if (i % 256 == 255) {
-    //         std::cout << std::endl;
-    //     }
-    // }
-    // std::cout << std::endl;
-    // std::cout << "----------------------------------------" << std::endl;
-    // for(int i = 0; i <  4096; i++) {
-    //     std::cout << Y_h[i] << " ";
-    //     if (i % 256 == 255) {
-    //         std::cout << std::endl;
-    //     }
-    // }
-    // std::cout << std::endl;
-    // std::cout << "----------------------------------------" << std::endl;
-    // for (int p = 0; p < (N + 4095) / 4096; p++) {
-    //     data_t scan_h = 0;
-    //     for (int i = 0; i < 4096; i++) {
-    //         if (p * 4096 + i >= N) {
-    //             break;
-    //         }
-    //         scan_h += X_h[p * 4096 + i];
-    //     }
-    //     printf("%d ", scan_h);
-    // }
-    // std::cout << std::endl;
 
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    // test_scan_openmp(X_h, Y_h, N);
-    // test_memcpy_d2d(X_h, Y_h, N);
+    test_scan_openmp(X_h, Y_h, N);
+    test_memcpy_d2d(X_h, Y_h, N);
     test_scan_cub(X_h, Y_h, N);
     test_scan_handcraft(X_h, Y_h, N);
  
