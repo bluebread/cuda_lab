@@ -36,6 +36,19 @@ union InclusivePrefixDescriptor {
     uint64_t u64;
 };
 
+union Descriptor {
+    struct {
+        enum class State{
+            Invalid,
+            AggregateAvailable,
+            PrefixAvailable
+        } state;
+        data_t val;
+    };
+
+    uint64_t u64;
+};
+
 __global__ void check_results_kernel(const data_t * Y_d, const data_t * ans_d, int N, volatile bool* is_correct) {
     int align = 8;
     int max_len = ceilf((float)N / gridDim.x / align) * align;
@@ -134,14 +147,332 @@ __host__ void test_scan_cub(const data_t * X_h, const data_t * ans_h, int N) {
     const char * is_correct_s = check_results(Y_d, ans_d, N) ? "correct" : "incorrect";
     float throughput = (float)(N * sizeof(data_t) * 2) / (t * 1e-3) / 1e9;
     std::cout << "- Throughput (CUB): " << throughput << " GB/s"
-        << " [" << is_correct_s << ", time: " << t << " ms]\n"; 
+        << " [" << is_correct_s << ", time: " << t << " ms, " 
+        << "temp. space " << utils::formatBytes(temp_storage_bytes) << "]\n"; 
 
     cudaFree(X_d);
     cudaFree(Y_d);
     cudaFree(ans_d);
 }
 
-__global__ void scan_d_kernel(
+__device__ __forceinline__ data_t warp_exclusive_scan(data_t val, data_t * sum_addr = nullptr) {
+    const int warpIdx = threadIdx.x / warpSize;
+    const int laneIdx = threadIdx.x % warpSize;
+
+    data_t yi = val;
+    data_t yi_prev = 0;
+
+    /* The Kogge-Stone algorithm */
+
+    yi_prev = __shfl_up_sync(0xffffffff, yi, 1);
+    yi += (laneIdx >= 1) ? yi_prev : 0;
+    yi_prev = __shfl_up_sync(0xffffffff, yi, 2);
+    yi += (laneIdx >= 2) ? yi_prev : 0;
+    yi_prev = __shfl_up_sync(0xffffffff, yi, 4);
+    yi += (laneIdx >= 4) ? yi_prev : 0;
+    yi_prev = __shfl_up_sync(0xffffffff, yi, 8);
+    yi += (laneIdx >= 8) ? yi_prev : 0;
+    yi_prev = __shfl_up_sync(0xffffffff, yi, 16);
+    yi += (laneIdx >= 16) ? yi_prev : 0;
+
+    if (sum_addr != nullptr) {
+        *sum_addr = yi;
+    }
+
+    return yi - val;
+}
+
+template<typename T>
+__device__ __forceinline__ data_t block_reduce_max(T val, T * tmp_space) {
+    const int warpIdx = threadIdx.x / warpSize;
+    const int laneIdx = threadIdx.x % warpSize;
+    const int num_warps = blockDim.x / warpSize;
+    
+    val = __reduce_max_sync(0xffffffff, val);
+
+    if (laneIdx == 0)
+        tmp_space[warpIdx] = val;
+
+    __syncthreads();
+
+    if (threadIdx.x < warpSize) {
+        T temp = (threadIdx.x < num_warps) ? tmp_space[threadIdx.x] : -1;
+        tmp_space[threadIdx.x] = __reduce_max_sync(0xffffffff, temp);
+    }
+
+    __syncthreads();
+
+    return tmp_space[warpIdx];
+}
+
+template<typename T>
+__device__ __forceinline__ data_t block_reduce_add(T val, T * tmp_space) {
+    const int warpIdx = threadIdx.x / warpSize;
+    const int laneIdx = threadIdx.x % warpSize;
+    const int num_warps = blockDim.x / warpSize;
+    
+    val = __reduce_add_sync(0xffffffff, val);
+
+    if (laneIdx == 0)
+        tmp_space[warpIdx] = val;
+
+    __syncthreads();
+
+    if (threadIdx.x < warpSize) {
+        T temp = (threadIdx.x < num_warps) ? tmp_space[threadIdx.x] : 0;
+        tmp_space[threadIdx.x] = __reduce_add_sync(0xffffffff, temp);
+    }
+
+    __syncthreads();
+
+    return tmp_space[warpIdx];
+}
+
+__global__ void scan_d_kernel_v2(
+    const data_t *      X, 
+    data_t *            Y, 
+    int                 N, 
+    unsigned int *      block_counter,
+    Descriptor *        descriptor_table) {
+
+    __shared__ data_t Y_s[2048];
+    __shared__ data_t sdata[128];
+    __shared__ unsigned int bid_s;
+    
+    const int warpIdx = threadIdx.x / warpSize;
+    const int laneIdx = threadIdx.x % warpSize;
+    const int num_warps = blockDim.x / warpSize;
+    const int partition_size = 4 * warpSize * warpSize;
+    
+    int base, len;
+
+    if (threadIdx.x == 0) {
+        bid_s = atomicAdd(block_counter, 1);
+    }
+
+    __syncthreads();
+
+    base = bid_s * partition_size;
+    len = min(partition_size, N - base);
+
+    while (base < N) {
+
+        /* Load data in registers or shared memory */
+
+        data_t x0 = (base + threadIdx.x + 0 * blockDim.x < len) ? X[base + threadIdx.x + 0 * blockDim.x] : 0;
+        data_t x1 = (base + threadIdx.x + 1 * blockDim.x < len) ? X[base + threadIdx.x + 1 * blockDim.x] : 0;
+        data_t x2 = (base + threadIdx.x + 2 * blockDim.x < len) ? X[base + threadIdx.x + 2 * blockDim.x] : 0;
+        data_t x3 = (base + threadIdx.x + 3 * blockDim.x < len) ? X[base + threadIdx.x + 3 * blockDim.x] : 0;
+        data_t x4 = (base + threadIdx.x + 4 * blockDim.x < len) ? X[base + threadIdx.x + 4 * blockDim.x] : 0;
+        data_t x5 = (base + threadIdx.x + 5 * blockDim.x < len) ? X[base + threadIdx.x + 5 * blockDim.x] : 0;
+        data_t x6 = (base + threadIdx.x + 6 * blockDim.x < len) ? X[base + threadIdx.x + 6 * blockDim.x] : 0;
+        data_t x7 = (base + threadIdx.x + 7 * blockDim.x < len) ? X[base + threadIdx.x + 7 * blockDim.x] : 0;
+        data_t x8 = (base + threadIdx.x + 8 * blockDim.x < len) ? X[base + threadIdx.x + 8 * blockDim.x] : 0;
+        data_t x9 = (base + threadIdx.x + 9 * blockDim.x < len) ? X[base + threadIdx.x + 9 * blockDim.x] : 0;
+        data_t x10 = (base + threadIdx.x + 10 * blockDim.x < len) ? X[base + threadIdx.x + 10 * blockDim.x] : 0;
+        data_t x11 = (base + threadIdx.x + 11 * blockDim.x < len) ? X[base + threadIdx.x + 11 * blockDim.x] : 0;
+        data_t x12 = (base + threadIdx.x + 12 * blockDim.x < len) ? X[base + threadIdx.x + 12 * blockDim.x] : 0;
+        data_t x13 = (base + threadIdx.x + 13 * blockDim.x < len) ? X[base + threadIdx.x + 13 * blockDim.x] : 0;
+        data_t x14 = (base + threadIdx.x + 14 * blockDim.x < len) ? X[base + threadIdx.x + 14 * blockDim.x] : 0;
+        data_t x15 = (base + threadIdx.x + 15 * blockDim.x < len) ? X[base + threadIdx.x + 15 * blockDim.x] : 0;
+
+        data_t y0, y1, y2, y3, y4, y5, y6, y7;
+        data_t & y8 = Y_s[threadIdx.x + 0 * blockDim.x];
+        data_t & y9 = Y_s[threadIdx.x + 1 * blockDim.x];
+        data_t & y10 = Y_s[threadIdx.x + 2 * blockDim.x];
+        data_t & y11 = Y_s[threadIdx.x + 3 * blockDim.x];
+        data_t & y12 = Y_s[threadIdx.x + 4 * blockDim.x];
+        data_t & y13 = Y_s[threadIdx.x + 5 * blockDim.x];
+        data_t & y14 = Y_s[threadIdx.x + 6 * blockDim.x];
+        data_t & y15 = Y_s[threadIdx.x + 7 * blockDim.x];
+
+        /* The Kogge-Stone algorithm (Warp level) */
+
+        y0 = warp_exclusive_scan(x0);
+        y1 = warp_exclusive_scan(x1);
+        y2 = warp_exclusive_scan(x2);
+        y3 = warp_exclusive_scan(x3);
+        y4 = warp_exclusive_scan(x4);
+        y5 = warp_exclusive_scan(x5);
+        y6 = warp_exclusive_scan(x6);
+        y7 = warp_exclusive_scan(x7);
+        y8 = warp_exclusive_scan(x8);
+        y9 = warp_exclusive_scan(x9);
+        y10 = warp_exclusive_scan(x10);
+        y11 = warp_exclusive_scan(x11);
+        y12 = warp_exclusive_scan(x12);
+        y13 = warp_exclusive_scan(x13);
+        y14 = warp_exclusive_scan(x14);
+        y15 = warp_exclusive_scan(x15);
+
+        if (laneIdx == warpSize - 1) {
+            sdata[warpIdx + 0 * num_warps] = x0 + y0;
+            sdata[warpIdx + 1 * num_warps] = x1 + y1;
+            sdata[warpIdx + 2 * num_warps] = x2 + y2;
+            sdata[warpIdx + 3 * num_warps] = x3 + y3;
+            sdata[warpIdx + 4 * num_warps] = x4 + y4;
+            sdata[warpIdx + 5 * num_warps] = x5 + y5;
+            sdata[warpIdx + 6 * num_warps] = x6 + y6;
+            sdata[warpIdx + 7 * num_warps] = x7 + y7;
+            sdata[warpIdx + 8 * num_warps] = x8 + y8;
+            sdata[warpIdx + 9 * num_warps] = x9 + y9;
+            sdata[warpIdx + 10 * num_warps] = x10 + y10;
+            sdata[warpIdx + 11 * num_warps] = x11 + y11;
+            sdata[warpIdx + 12 * num_warps] = x12 + y12;
+            sdata[warpIdx + 13 * num_warps] = x13 + y13;
+            sdata[warpIdx + 14 * num_warps] = x14 + y14;
+            sdata[warpIdx + 15 * num_warps] = x15 + y15;
+        }
+
+        __syncthreads();
+
+        /* Coarsened scan (Block level) */
+
+        data_t aggregate = 0;
+
+        if (threadIdx.x < warpSize) {
+            for (int i = 0; i < 4; i++) {
+                data_t s;
+                data_t xi = sdata[threadIdx.x + i * warpSize];
+                data_t yi = warp_exclusive_scan(xi, &s);
+                sdata[threadIdx.x + i * warpSize] = yi + aggregate;
+                aggregate += s;
+            }
+        }
+
+        __syncthreads();
+
+        y0 += sdata[warpIdx + 0 * num_warps];
+        y1 += sdata[warpIdx + 1 * num_warps];
+        y2 += sdata[warpIdx + 2 * num_warps];
+        y3 += sdata[warpIdx + 3 * num_warps];
+        y4 += sdata[warpIdx + 4 * num_warps];
+        y5 += sdata[warpIdx + 5 * num_warps];
+        y6 += sdata[warpIdx + 6 * num_warps];
+        y7 += sdata[warpIdx + 7 * num_warps];
+        y8 += sdata[warpIdx + 8 * num_warps];
+        y9 += sdata[warpIdx + 9 * num_warps];
+        y10 += sdata[warpIdx + 10 * num_warps];
+        y11 += sdata[warpIdx + 11 * num_warps];
+        y12 += sdata[warpIdx + 12 * num_warps];
+        y13 += sdata[warpIdx + 13 * num_warps];
+        y14 += sdata[warpIdx + 14 * num_warps];
+        y15 += sdata[warpIdx + 15 * num_warps];
+
+        __syncthreads();
+        
+        /* The Merrill-Garland Algorithm (Device level)  */
+        // paper: https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
+
+        data_t pred_sum = 0;
+        int inclpref_idx = -1;
+
+        if (threadIdx.x == warpSize - 1) {
+            union Descriptor desr;
+
+            // Optimization: Fence-free descriptor update
+            desr.state = Descriptor::State::AggregateAvailable;
+            desr.val = aggregate;
+            descriptor_table[bid_s].u64 = desr.u64;
+        }
+
+        // Optimization: Parallelized look-back
+        for (int k = bid_s - blockDim.x + threadIdx.x; inclpref_idx < 0 && (int)(k - threadIdx.x + blockDim.x) > 0; k -= blockDim.x) {
+            union Descriptor pred_desr;
+
+            inclpref_idx = -1;
+            pred_desr.u64 = 0;
+            
+            if (k >= 0) {
+                do {
+                    pred_desr.u64 = atomicAdd(
+                        (unsigned long long int *)(&descriptor_table[k].u64), 0);
+                } while (pred_desr.state == Descriptor::State::Invalid);
+                __threadfence();
+
+                if (pred_desr.state == Descriptor::State::PrefixAvailable) {
+                    inclpref_idx = k;
+                }
+            }
+
+            inclpref_idx = block_reduce_max(inclpref_idx, sdata);
+            
+            // Case 1: All predecessors have status "A"
+            if (inclpref_idx < 0 && (int)(k - threadIdx.x) > 0) {
+                // Since all predecessors have status "A", we can safely add the value 
+                // and continue to the next iteration. 
+                pred_sum += pred_desr.val;
+                continue;
+            }
+
+            // Case 2: At least one predecessor has status "P"
+            if (k >= inclpref_idx) 
+                pred_sum += pred_desr.val;
+
+            pred_sum = block_reduce_add(pred_sum, sdata);
+
+            break;
+        }
+
+        /* Save results */
+
+        if (base + threadIdx.x + 0 * blockDim.x < len)
+            Y[base + threadIdx.x + 0 * blockDim.x] = y0 + pred_sum;
+        if (base + threadIdx.x + 1 * blockDim.x < len)
+            Y[base + threadIdx.x + 1 * blockDim.x] = y1 + pred_sum;
+        if (base + threadIdx.x + 2 * blockDim.x < len)
+            Y[base + threadIdx.x + 2 * blockDim.x] = y2 + pred_sum;
+        if (base + threadIdx.x + 3 * blockDim.x < len)
+            Y[base + threadIdx.x + 3 * blockDim.x] = y3 + pred_sum;
+        if (base + threadIdx.x + 4 * blockDim.x < len)
+            Y[base + threadIdx.x + 4 * blockDim.x] = y4 + pred_sum;
+        if (base + threadIdx.x + 5 * blockDim.x < len)
+            Y[base + threadIdx.x + 5 * blockDim.x] = y5 + pred_sum;
+        if (base + threadIdx.x + 6 * blockDim.x < len)
+            Y[base + threadIdx.x + 6 * blockDim.x] = y6 + pred_sum;
+        if (base + threadIdx.x + 7 * blockDim.x < len)
+            Y[base + threadIdx.x + 7 * blockDim.x] = y7 + pred_sum;
+        if (base + threadIdx.x + 8 * blockDim.x < len)
+            Y[base + threadIdx.x + 8 * blockDim.x] = y8 + pred_sum;
+        if (base + threadIdx.x + 9 * blockDim.x < len)
+            Y[base + threadIdx.x + 9 * blockDim.x] = y9 + pred_sum;
+        if (base + threadIdx.x + 10 * blockDim.x < len)
+            Y[base + threadIdx.x + 10 * blockDim.x] = y10 + pred_sum;
+        if (base + threadIdx.x + 11 * blockDim.x < len)
+            Y[base + threadIdx.x + 11 * blockDim.x] = y11 + pred_sum;
+        if (base + threadIdx.x + 12 * blockDim.x < len)
+            Y[base + threadIdx.x + 12 * blockDim.x] = y12 + pred_sum;
+        if (base + threadIdx.x + 13 * blockDim.x < len)
+            Y[base + threadIdx.x + 13 * blockDim.x] = y13 + pred_sum;
+        if (base + threadIdx.x + 14 * blockDim.x < len)
+            Y[base + threadIdx.x + 14 * blockDim.x] = y14 + pred_sum;
+        if (base + threadIdx.x + 15 * blockDim.x < len)
+            Y[base + threadIdx.x + 15 * blockDim.x] = y15 + pred_sum;
+
+        /* Save prefix sum in the descriptor table */
+
+        if (threadIdx.x == warpSize - 1) {
+            union Descriptor desr;
+
+            desr.state = Descriptor::State::PrefixAvailable;
+            desr.val = pred_sum + aggregate;
+            descriptor_table[bid_s].u64 = desr.u64;
+        }
+
+        /* get next block id */
+
+        if (threadIdx.x == 0) {
+            bid_s = atomicAdd(block_counter, 1);
+        }
+
+        __syncthreads();
+
+        base = bid_s * partition_size;
+        len = min(partition_size, N - base);
+    }
+}
+
+__global__ void scan_d_kernel_v1(
     const data_t *              X, 
     data_t *                    Y, 
     int                         N, 
@@ -335,13 +666,13 @@ __host__ void malloc_persisting_data(T ** ptr_addr, unsigned int n, float hit_ra
     cudaMalloc(ptr_addr, n * sizeof(T));
     cudaMemset(*ptr_addr, 0, n * sizeof(T));
 
-    // cudaStreamAttrValue stream_attribute;   
-    // stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(*ptr_addr);
-    // stream_attribute.accessPolicyWindow.num_bytes = n * sizeof(T);
-    // stream_attribute.accessPolicyWindow.hitRatio  = hit_ratio;
-    // stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-    // stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-    // cudaStreamSetAttribute(cudaStreamDefault, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+    cudaStreamAttrValue stream_attribute;   
+    stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(*ptr_addr);
+    stream_attribute.accessPolicyWindow.num_bytes = n * sizeof(T);
+    stream_attribute.accessPolicyWindow.hitRatio  = hit_ratio;
+    stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(cudaStreamDefault, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
 }
 
 __host__ std::string descriptor_to_string(AggregateDescriptor agd, InclusivePrefixDescriptor ipd) {
@@ -387,10 +718,11 @@ __host__ void test_scan_handcraft(const data_t * X_h, const data_t * ans_h, int 
     malloc_persisting_data<AggregateDescriptor>(&aggregate_descriptor_table_d, num_partitions);
     malloc_persisting_data<InclusivePrefixDescriptor>(&inclusive_prefix_descriptor_table_d, num_partitions);
     malloc_persisting_data<unsigned int>(&block_counter_d, 1);
+    cudaDeviceSynchronize();
 
     cudaEventRecord(start);
 
-    scan_d_kernel<<<num_blocks, num_threads>>>(
+    scan_d_kernel_v1<<<num_blocks, num_threads>>>(
         X_d, 
         Y_d, 
         N, 
@@ -515,8 +847,8 @@ __host__ int main(int argc, char ** argv) {
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    // test_scan_openmp(X_h, Y_h, N);
-    test_memcpy_d2d(X_h, Y_h, N);
+    test_scan_openmp(X_h, Y_h, N);
+    // test_memcpy_d2d(X_h, Y_h, N);
     test_scan_cub(X_h, Y_h, N);
     test_scan_handcraft(X_h, Y_h, N);
  
